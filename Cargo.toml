@@ -1,0 +1,3 @@
+[workspace]
+members = ["mctools-lib", "mctools-cli"]
+resolver = "2"
