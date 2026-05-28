@@ -11,6 +11,7 @@
 
 use crate::crypto;
 use crate::utils;
+#[cfg(feature = "native")]
 use std::path::Path;
 
 /// A stored content key entry.
@@ -116,9 +117,13 @@ impl Keys {
             return;
         }
 
+        #[cfg(feature = "native")]
         if add_to_key_cache && !self.key_db_file.is_empty() {
-            let entry = format!("{}={}\n", friendly_id,
-                String::from_utf8_lossy(content_key));
+            let entry = format!(
+                "{}={}\n",
+                friendly_id,
+                String::from_utf8_lossy(content_key)
+            );
             let _ = std::fs::write(&self.key_db_file, entry.as_bytes());
         }
 
@@ -156,7 +161,8 @@ impl Keys {
     /// Handle entitlements from a receipt JSON.
     fn handle_entitlements(&mut self, entitlements: &[serde_json::Value], user_key: &[u8]) {
         for ent in entitlements {
-            let friendly_id = ent["FriendlyId"].as_str()
+            let friendly_id = ent["FriendlyId"]
+                .as_str()
                 .or_else(|| ent["PackId"].as_str())
                 .map(String::from);
 
@@ -225,7 +231,10 @@ impl Keys {
         }
     }
 
+    // --- Filesystem-dependent operations ---
+
     /// Read options.txt to extract `last_minecraft_id` and `last_title_account_id`.
+    #[cfg(feature = "native")]
     pub fn read_options_txt(&mut self, options_txt_path: &Path) -> std::io::Result<()> {
         let content = std::fs::read_to_string(options_txt_path)?;
         for line in content.lines() {
@@ -280,11 +289,13 @@ impl Keys {
             k[..len].copy_from_slice(&ent_key[..len]);
             k
         };
-        let ent_plaintext = crypto::aes256_cfb_decrypt(&key_32, &ent_ciphertext, ent_ciphertext.len());
+        let ent_plaintext =
+            crypto::aes256_cfb_decrypt(&key_32, &ent_ciphertext, ent_ciphertext.len());
         String::from_utf8(ent_plaintext).ok()
     }
 
     /// Read an `.ent` entitlement file and extract content keys.
+    #[cfg(feature = "native")]
     pub fn read_entitlement_file(&mut self, ent_path: &Path) -> std::io::Result<()> {
         let json_data = std::fs::read_to_string(ent_path)?;
 
@@ -323,8 +334,9 @@ impl Keys {
             }
         } else {
             // JWT-style: take the second segment (payload)
-            let payload = receipt_b64.split('.').nth(1)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid JWT format"))?;
+            let payload = receipt_b64.split('.').nth(1).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid JWT format")
+            })?;
             match utils::force_decode_base64(payload) {
                 Some(bytes) => String::from_utf8(bytes).ok(),
                 None => None,
@@ -369,6 +381,7 @@ impl Keys {
     }
 
     /// Read a keys.db file with `friendlyId=contentKey` lines.
+    #[cfg(feature = "native")]
     pub fn read_keys_db(&mut self, key_file: &Path) -> std::io::Result<()> {
         self.key_db_file = key_file.to_string_lossy().to_string();
         let content = std::fs::read_to_string(key_file)?;

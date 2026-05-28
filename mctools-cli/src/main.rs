@@ -122,6 +122,37 @@ fn save_content_key(pack_path: &Path, entry: &PEntry, keys: &Keys) {
     let _ = std::fs::write(content_key_path, key_string.as_bytes());
 }
 
+/// Decrypt a pack by directory path (bypasses PReader scan).
+fn decrypt_pack_by_path(
+    config: &Config,
+    keys: &Keys,
+    pack_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(pack_path);
+    if !path.is_dir() {
+        return Err(format!("Directory does not exist: {}", pack_path).into());
+    }
+
+    let entry = PEntry::new(path);
+    let out_folder_base = config
+        .out_folder
+        .join(&entry.product_type())
+        .join(escape_filename(&entry.name()));
+    let out_folder = unique_path(&out_folder_base);
+
+    println!("Decrypting: {}", entry.name());
+    std::fs::create_dir_all(&out_folder)?;
+    copy_directory(path, &out_folder)?;
+    decrypt_pack(&out_folder, &entry, config, keys)?;
+
+    if config.zip_packs {
+        zip_pack(&entry, &out_folder)?;
+    }
+
+    println!("  Done: {}", entry.name());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // CLI structure
 // ---------------------------------------------------------------------------
@@ -157,6 +188,9 @@ enum Commands {
     Decrypt {
         /// Pack indices (e.g. "1,3,5") or "ALL"
         selections: Option<String>,
+        /// Direct path to a pack directory to decrypt
+        #[arg(short, long)]
+        path: Option<String>,
     },
     /// Decrypt ALL packs non-interactively
     DecryptAll,
@@ -225,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::List => run_list(&config, &keys),
-        Commands::Decrypt { selections } => run_decrypt(&config, &mut keys, selections),
+        Commands::Decrypt { selections, path } => run_decrypt(&config, &mut keys, selections, path),
         Commands::DecryptAll => run_decrypt_all(&config, &mut keys),
         Commands::Encrypt { pack_path } => run_encrypt(&pack_path, &mut keys),
         Commands::ExtractKeys => run_extract_keys(&config, &mut keys),
@@ -252,7 +286,12 @@ fn run_decrypt(
     config: &Config,
     keys: &Keys,
     selections: Option<String>,
+    path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(p) = path {
+        return decrypt_pack_by_path(config, keys, &p);
+    }
+
     let p_reader = PReader::new(config);
     let entries = p_reader.pentry_list();
 

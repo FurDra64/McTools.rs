@@ -1,0 +1,16 @@
+Notice
+======
+
+This repository is a Rust port of the McTools / McCrypt toolset originally
+written in C# by Li (LiEnby) — https://github.com/LiEnby
+
+Original C# source: https://silica.codes/BedrockReverse/McTools
+
+The original C# code was distributed without a license ("All rights reserved"
+by default under copyright law).  All rights to the original C# code remain
+with its respective authors.
+
+The Rust code in this repository is an independent port written from scratch
+and is dedicated to the public domain under the Unlicense (see UNLICENSE).
+
+This project was created using OpenCode VibeCoding.

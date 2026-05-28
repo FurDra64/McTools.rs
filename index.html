@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>McTools — Persona Encryptor</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #e94560;
+  --accent-hover: #ff6b81;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:var(--bg);color:var(--text);
+  min-height:100dvh;line-height:1.5
+}
+.container{max-width:720px;margin:0 auto;padding:24px 16px}
+
+/* Header */
+header{display:flex;align-items:center;gap:10px;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px}
+header h1{font-size:1.1rem;font-weight:600}
+header span{color:var(--text-dim);font-size:.82rem}
+
+/* Drop zone */
+.drop-zone{
+  border:2px dashed var(--border);border-radius:6px;padding:32px 20px;
+  text-align:center;cursor:pointer;transition:border-color .2s,background .2s;
+  position:relative
+}
+.drop-zone.dragover{border-color:var(--accent);background:#1a1a2e}
+.drop-zone.has-file{border-style:solid;border-color:var(--border);padding:12px 16px}
+.drop-zone .icon{font-size:2rem;margin-bottom:6px}
+.drop-zone .label{font-size:.9rem;color:var(--text-dim)}
+.drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer}
+
+/* Error */
+.error{display:none;background:#2d1215;border:1px solid #4a2025;border-radius:6px;padding:10px 14px;margin:12px 0;font-size:.85rem;white-space:pre-wrap;word-break:break-all}
+.error.active{display:block}
+
+/* File tree */
+.file-tree{display:none;margin-top:16px}
+.file-tree.active{display:block}
+
+.tree-row{
+  display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:4px;
+  cursor:default;font-size:.85rem;transition:background .15s
+}
+.tree-row:hover{background:var(--surface)}
+.tree-row .icon{flex-shrink:0;width:18px;text-align:center;font-size:.75rem;opacity:.7}
+.tree-row .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tree-row .size{color:var(--text-dim);font-size:.75rem;flex-shrink:0}
+.tree-row .arrow{
+  flex-shrink:0;width:14px;text-align:center;font-size:.65rem;
+  color:var(--text-dim);transition:transform .15s;user-select:none
+}
+.tree-row.dir{cursor:pointer}
+.tree-row.dir .arrow{display:inline}
+.tree-children{padding-left:20px;display:none}
+.tree-children.open{display:block}
+
+/* File count badge */
+.file-count{display:flex;align-items:center;gap:6px;margin-bottom:10px;padding:6px 10px;background:var(--surface);border-radius:6px;font-size:.8rem;color:var(--text-dim)}
+.file-count span{color:var(--text)}
+
+/* Spinner */
+.spinner{display:none;text-align:center;padding:32px}
+.spinner.active{display:block}
+.spinner-inner{
+  width:28px;height:28px;border:3px solid var(--border);
+  border-top-color:var(--accent);border-radius:50%;
+  animation:spin .8s linear infinite;margin:0 auto 10px
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner .msg{font-size:.85rem;color:var(--text-dim)}
+
+/* Save bar */
+.save-bar{display:none;position:sticky;bottom:0;padding:12px 0;background:var(--bg)}
+.save-bar.active{display:block}
+.save-bar button{
+  width:100%;padding:12px;
+  background:var(--accent);color:#fff;border:none;border-radius:6px;
+  font-size:.95rem;font-weight:600;cursor:pointer;transition:opacity .15s
+}
+.save-bar button:disabled{opacity:.4;cursor:not-allowed}
+.save-bar button:not(:disabled):active{opacity:.8}
+</style>
+</head>
+<body>
+<div class="container">
+  <header><h1>🧊 McTools</h1><span>Persona Encryptor</span></header>
+
+  <div class="drop-zone" id="dropZone">
+    <input type="file" id="fileInput" accept=".zip,.mcpack">
+    <div class="icon">📦</div>
+    <div class="label">Select a skin pack zip</div>
+  </div>
+
+  <div class="error" id="error"><div id="errorMsg"></div></div>
+
+  <div class="spinner" id="spinner">
+    <div class="spinner-inner"></div>
+    <div class="msg" id="spinnerMsg">Processing…</div>
+  </div>
+
+  <div class="file-tree" id="fileTree">
+    <div class="file-count">📁 <span id="fileCount">0</span> files</div>
+    <div id="treeRoot"></div>
+  </div>
+
+  <div class="save-bar" id="saveBar">
+    <button id="saveBtn" disabled>🔒 Encrypt & Download</button>
+  </div>
+</div>
+
+<script type="module">
+import init, * as mctools from './mctools_wasm.js';
+import JSZip from 'https://esm.sh/jszip@3.10.1';
+
+const HARDCODED_KEY = 's5s5ejuDru4uchuF2drUFuthaspAbepE';
+
+const $ = id => document.getElementById(id);
+const dropZone = $('dropZone');
+const fileInput = $('fileInput');
+const errorDiv = $('error');
+const errorMsg = $('errorMsg');
+const spinner = $('spinner');
+const spinnerMsg = $('spinnerMsg');
+const fileTree = $('fileTree');
+const treeRoot = $('treeRoot');
+const fileCount = $('fileCount');
+const saveBar = $('saveBar');
+const saveBtn = $('saveBtn');
+
+let state = { files: [], baseDir: '' };
+
+function showError(msg) { errorMsg.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg); errorDiv.classList.add('active'); }
+function hideError() { errorDiv.classList.remove('active'); }
+function showSpinner(msg) { spinnerMsg.textContent = msg; spinner.classList.add('active'); }
+function hideSpinner() { spinner.classList.remove('active'); }
+function bytesToStr(b) { return new TextDecoder().decode(b); }
+function strToBytes(s) { return new TextEncoder().encode(s); }
+function formatSize(b) { return b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(1) + ' KB' : (b/1048576).toFixed(1) + ' MB'; }
+
+function generateKey() {
+  const c = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890';
+  const r = crypto.getRandomValues(new Uint8Array(32));
+  let k = '';
+  for (let i = 0; i < 32; i++) k += c[r[i] % c.length];
+  return k;
+}
+
+// ---- Tree building ----
+function buildTree(files) {
+  const root = { name: '', children: {}, files: [] };
+  for (const f of files) {
+    const parts = f.path.split('/');
+    let node = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!node.children[parts[i]]) node.children[parts[i]] = { name: parts[i], children: {}, files: [] };
+      node = node.children[parts[i]];
+    }
+    node.files.push(f);
+  }
+  return root;
+}
+
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function renderTree(node, container) {
+  const keys = Object.keys(node.children).sort();
+  for (const k of keys) {
+    const child = node.children[k];
+    const dirDiv = document.createElement('div');
+    dirDiv.innerHTML = `<div class="tree-row dir"><span class="arrow">▶</span><span class="icon">📁</span><span class="name">${esc(k)}</span></div><div class="tree-children"></div>`;
+    const row = dirDiv.querySelector('.tree-row');
+    const childrenDiv = dirDiv.querySelector('.tree-children');
+    row.onclick = () => {
+      childrenDiv.classList.toggle('open');
+      row.querySelector('.arrow').style.transform = childrenDiv.classList.contains('open') ? 'rotate(90deg)' : '';
+    };
+    container.appendChild(dirDiv);
+    renderTree(child, childrenDiv);
+  }
+  const sortedFiles = [...node.files].sort((a, b) => a.path.localeCompare(b.path));
+  for (const f of sortedFiles) {
+    const icon = f.path.match(/\.(png|jpg|jpeg|gif|webp)$/i) ? '🖼️' : '📄';
+    const row = document.createElement('div');
+    row.className = 'tree-row';
+    row.innerHTML = `<span class="arrow"></span><span class="icon">${icon}</span><span class="name">${esc(f.name)}</span><span class="size">${formatSize(f.data.length)}</span>`;
+    container.appendChild(row);
+  }
+}
+
+// ---- Load zip ----
+async function loadZip(file) {
+  if (!file.name.match(/\.(zip|mcpack)$/i)) { showError('Select a .zip or .mcpack file'); return; }
+  dropZone.classList.add('has-file');
+  dropZone.querySelector('.label').textContent = file.name;
+  hideError();
+  showSpinner('Reading zip…');
+  try {
+    await init();
+    const zipData = await file.arrayBuffer();
+    const zip = await JSZip.loadAsync(zipData);
+    const loaded = [];
+    zip.forEach((p, e) => { if (!e.dir) loaded.push({ path: p, entry: e }); });
+    const files = [];
+    for (const item of loaded) {
+      files.push({ path: item.path, data: new Uint8Array(await item.entry.async('arraybuffer')), name: item.path.split('/').pop() || item.path });
+    }
+
+    // Determine base dir (where manifest.json lives)
+    const mf = files.find(f => f.path.endsWith('manifest.json'));
+    state.baseDir = mf ? mf.path.slice(0, mf.path.lastIndexOf('/') + 1) : '';
+    state.files = files;
+
+    hideSpinner();
+    renderTreeView(files);
+  } catch (e) { hideSpinner(); showError(e.message || String(e)); console.error(e); }
+}
+
+// ---- Render tree ----
+function renderTreeView(files) {
+  fileCount.textContent = files.length;
+  const root = buildTree(files);
+  treeRoot.innerHTML = '';
+  renderTree(root, treeRoot);
+  // Auto-open the single top-level directory (common case)
+  const firstContainer = treeRoot.querySelector(':scope > div:first-child');
+  const firstDir = firstContainer?.querySelector('.tree-children');
+  if (firstDir && treeRoot.children.length === 1) {
+    firstDir.classList.add('open');
+    const arrow = firstContainer.querySelector('.tree-row .arrow');
+    if (arrow) arrow.style.transform = 'rotate(90deg)';
+  }
+  fileTree.classList.add('active');
+  saveBar.classList.add('active');
+  saveBtn.disabled = false;
+}
+
+// ---- Encrypt & Save ----
+async function encryptAndDownload() {
+  hideError();
+  saveBtn.disabled = true;
+  saveBtn.textContent = '⏳ Encrypting…';
+  try {
+    // Find manifest.json for UUID
+    const mf = state.files.find(f => f.path.endsWith('manifest.json'));
+    if (!mf) throw new Error('manifest.json not found');
+    let uuid;
+    try { uuid = JSON.parse(bytesToStr(mf.data)).header?.uuid; } catch(e) {}
+    if (!uuid) throw new Error('header.uuid not found in manifest.json');
+
+    const baseDir = state.baseDir;
+
+    // Build content list
+    const content = [];
+    for (const f of state.files) {
+      const name = f.path.split('/').pop() || f.path;
+      if (name === 'manifest.json' || name === 'pack_icon.png' || name === 'contents.json') {
+        content.push({ path: f.path });
+      } else {
+        const key = generateKey();
+        const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), f.data);
+        f._encrypted = enc;
+        content.push({ path: f.path, key });
+      }
+    }
+
+    // Build & encrypt contents.json
+    const cjStr = JSON.stringify({ version: 1, content }, null, 2);
+    const encCj = mctools.aes256_cfb8_encrypt(strToBytes(HARDCODED_KEY), strToBytes(cjStr));
+    const finalCj = mctools.build_encrypted_header(uuid, encCj);
+
+    // Build signatures.json (SHA-256 of manifest.json)
+    const hash = mctools.sha256_digest(mf.data);
+    const b64 = btoa(String.fromCharCode(...hash));
+    const sigs = JSON.stringify([{ hash: b64, path: mf.path.slice(baseDir.length) } || 'manifest.json'], null, 2);
+
+    // Build output zip
+    const newZip = new JSZip();
+    newZip.file(baseDir + 'contents.json', new Uint8Array(finalCj));
+    newZip.file(baseDir + 'signatures.json', strToBytes(sigs));
+
+    for (const f of state.files) {
+      const name = f.path.split('/').pop() || f.path;
+      const skip = name === 'manifest.json' || name === 'pack_icon.png' || name === 'contents.json';
+      newZip.file(f.path, new Uint8Array(skip ? f.data : (f._encrypted || f.data)));
+    }
+
+    const blob = await newZip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'persona_encrypted.zip';
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    saveBtn.textContent = '✅ Done';
+    setTimeout(() => { saveBtn.textContent = '🔒 Encrypt & Download'; saveBtn.disabled = false; }, 2000);
+  } catch (e) {
+    showError(e.message || String(e));
+    saveBtn.textContent = '🔒 Encrypt & Download';
+    saveBtn.disabled = false;
+  }
+}
+
+// ---- Events ----
+saveBtn.addEventListener('click', encryptAndDownload);
+fileInput.addEventListener('change', e => { if (e.target.files[0]) loadZip(e.target.files[0]); });
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) loadZip(e.dataTransfer.files[0]);
+});
+console.log('McTools ready');
+</script>
+</body>
+</html>

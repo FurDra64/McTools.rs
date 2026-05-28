@@ -2,6 +2,7 @@
 name = "mctools-cli"
 version = "0.1.0"
 edition = "2021"
+license = "Unlicense"
 description = "McTools CLI - Decrypt and encrypt Minecraft Bedrock marketplace content"
 
 [dependencies]
