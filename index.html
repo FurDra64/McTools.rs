@@ -123,6 +123,15 @@ import init, * as mctools from './mctools_wasm.js';
 import JSZip from 'https://esm.sh/jszip@3.10.1';
 
 const HARDCODED_KEY = 's5s5ejuDru4uchuF2drUFuthaspAbepE';
+// Must match C# McCrypt.Marketplace.dontEncrypt exactly
+const DONT_ENCRYPT = new Set(['manifest.json', 'contents.json', 'texts', 'pack_icon.png']);
+
+function shouldEncrypt(relPath) {
+  for (const part of relPath.split('/')) {
+    if (DONT_ENCRYPT.has(part)) return false;
+  }
+  return true;
+}
 
 const $ = id => document.getElementById(id);
 const dropZone = $('dropZone');
@@ -259,42 +268,83 @@ async function encryptAndDownload() {
 
     const baseDir = state.baseDir;
 
-    // Build content list
-    const content = [];
+    // Build a map of relative path → file entry (paths inside content list must be relative like C#)
+    const fileMap = new Map();
     for (const f of state.files) {
-      const name = f.path.split('/').pop() || f.path;
-      if (name === 'manifest.json' || name === 'pack_icon.png' || name === 'contents.json') {
-        content.push({ path: f.path });
-      } else {
-        const key = generateKey();
-        const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), f.data);
-        f._encrypted = enc;
-        content.push({ path: f.path, key });
+      const relPath = f.path.startsWith(baseDir) ? f.path.slice(baseDir.length) : f.path;
+      fileMap.set(relPath, f);
+    }
+
+    // Collect unique directory paths (matches C# GetFileSystemEntries returning directories)
+    const dirSet = new Set();
+    for (const relPath of fileMap.keys()) {
+      const parts = relPath.split('/');
+      for (let i = 1; i < parts.length; i++) {
+        dirSet.add(parts.slice(0, i).join('/') + '/');
       }
     }
 
-    // Build & encrypt contents.json
-    const cjStr = JSON.stringify({ version: 1, content }, null, 2);
+    // Create signatures.json FIRST (C# calls SignManifest before EncryptContents)
+    const manifestRelPath = mf.path.startsWith(baseDir) ? mf.path.slice(baseDir.length) : mf.path;
+    const manifestHash = mctools.sha256_digest(mf.data);
+    const sigB64 = btoa(String.fromCharCode(...manifestHash));
+    const sigJsonStr = JSON.stringify([{ hash: sigB64, path: manifestRelPath }]);
+    const sigBuf = strToBytes(sigJsonStr);
+
+    // Build content list matching C# behaviour:
+    //   - Sort alphabetically for deterministic order
+    //   - Directory entries with trailing /, no key
+    //   - Files get encrypted or not based on shouldEncrypt(path)
+    //   - signatures.json is NOT in DONT_ENCRYPT → gets a key
+    const content = [];
+
+    // Collect all relative paths (files + directories), sort for deterministic order
+    const allPaths = new Set(fileMap.keys());
+    for (const dirPath of dirSet) allPaths.add(dirPath);
+    allPaths.add('signatures.json');  // will be signed
+    const sortedPaths = [...allPaths].sort();
+
+    for (const relPath of sortedPaths) {
+      if (relPath === 'signatures.json') {
+        // Signatures.json: generated, encrypt with a random key
+        const key = generateKey();
+        const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), sigBuf);
+        content.push({ path: relPath, key });
+        // Store for zip output (keyed by relPath)
+        fileMap.set(relPath, { data: sigBuf, _encrypted: enc });
+      } else if (dirSet.has(relPath)) {
+        // Directory entry: no key, no data
+        content.push({ path: relPath });
+      } else {
+        const f = fileMap.get(relPath);
+        if (f && shouldEncrypt(relPath)) {
+          const key = generateKey();
+          const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), f.data);
+          f._encrypted = enc;
+          content.push({ path: relPath, key });
+        } else if (f) {
+          content.push({ path: relPath });
+        }
+      }
+    }
+
+    // Build minified contents.json (must match C# JsonConvert.SerializeObject output)
+    const cjStr = JSON.stringify({ version: 1, content });
     const encCj = mctools.aes256_cfb8_encrypt(strToBytes(HARDCODED_KEY), strToBytes(cjStr));
     const finalCj = mctools.build_encrypted_header(uuid, encCj);
 
-    // Build signatures.json (SHA-256 of manifest.json)
-    const hash = mctools.sha256_digest(mf.data);
-    const b64 = btoa(String.fromCharCode(...hash));
-    const sigs = JSON.stringify([{ hash: b64, path: mf.path.slice(baseDir.length) } || 'manifest.json'], null, 2);
-
-    // Build output zip
+    // Build output zip (STORE compression matches C# in-place encryption)
     const newZip = new JSZip();
     newZip.file(baseDir + 'contents.json', new Uint8Array(finalCj));
-    newZip.file(baseDir + 'signatures.json', strToBytes(sigs));
 
-    for (const f of state.files) {
-      const name = f.path.split('/').pop() || f.path;
-      const skip = name === 'manifest.json' || name === 'pack_icon.png' || name === 'contents.json';
-      newZip.file(f.path, new Uint8Array(skip ? f.data : (f._encrypted || f.data)));
+    // Add all files (including signatures.json now in fileMap)
+    for (const [relPath, f] of fileMap) {
+      const fpath = baseDir + relPath;
+      const data = f._encrypted || f.data;
+      if (data) newZip.file(fpath, new Uint8Array(data));
     }
 
-    const blob = await newZip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const blob = await newZip.generateAsync({ type: 'blob', compression: 'STORE' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = 'persona_encrypted.zip';
