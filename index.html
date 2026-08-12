@@ -89,6 +89,30 @@ header span{color:var(--text-dim);font-size:.82rem}
 }
 .save-bar button:disabled{opacity:.4;cursor:not-allowed}
 .save-bar button:not(:disabled):active{opacity:.8}
+
+/* Debug panel (iOS Safari + File Picker extension diagnostics) */
+.debug-panel{margin-top:24px;border:1px solid var(--border);border-radius:6px;background:var(--surface)}
+.debug-header{display:flex;align-items:center;gap:8px;padding:10px 14px;cursor:pointer;user-select:none;font-size:.85rem;font-weight:600}
+.debug-header .arrow{font-size:.65rem;color:var(--text-dim);transition:transform .15s}
+.debug-panel.open .debug-header .arrow{transform:rotate(90deg)}
+.debug-body{display:none;padding:0 14px 14px;border-top:1px solid var(--border)}
+.debug-panel.open .debug-body{display:block}
+.debug-body h3{font-size:.8rem;color:var(--text-dim);margin:12px 0 6px;font-weight:600}
+.debug-actions{display:flex;gap:8px;flex-wrap:wrap}
+.debug-actions button{
+  padding:7px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  color:var(--text);font-size:.8rem;cursor:pointer;transition:border-color .15s,color .15s
+}
+.debug-actions button:hover{border-color:var(--accent);color:var(--accent)}
+.debug-actions button:disabled{opacity:.4;cursor:not-allowed}
+.diag-list{margin:0;padding:0;list-style:none;font-size:.8rem;display:grid;gap:2px}
+.diag-list li{display:flex;gap:6px;align-items:baseline;padding:1px 0}
+.diag-list .status{flex-shrink:0;width:16px;text-align:center;font-weight:700}
+.diag-list .ok{color:#3fb950}
+.diag-list .ng{color:#f85149}
+.diag-list .key{color:var(--text-dim);min-width:220px}
+.diag-hint{font-size:.75rem;color:var(--text-dim);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-top:10px;line-height:1.6}
+.test-log{margin:10px 0 0;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;white-space:pre-wrap;word-break:break-all;min-height:60px;max-height:240px;overflow:auto;color:var(--text)}
 </style>
 </head>
 <body>
@@ -115,6 +139,25 @@ header span{color:var(--text-dim);font-size:.82rem}
 
   <div class="save-bar" id="saveBar">
     <button id="saveBtn" disabled>🔒 Encrypt & Download</button>
+  </div>
+
+  <!-- Debug panel: iOS Safari + File Picker extension (File System Access API) diagnostics -->
+  <div class="debug-panel" id="debugPanel">
+    <div class="debug-header" id="debugHeader">
+      <span class="arrow">▶</span>🛠 ファイルピッカーデバッグ
+    </div>
+    <div class="debug-body">
+      <h3>診断 — 利用可能なファイル API</h3>
+      <div class="debug-actions">
+        <button id="diagBtn">🔍 診断を実行</button>
+      </div>
+      <ul class="diag-list" id="diagList"></ul>
+      <div class="debug-actions" style="margin-top:12px">
+        <button id="testOpenBtn">📂 開くテスト</button>
+        <button id="testSaveBtn">💾 保存テスト</button>
+      </div>
+      <pre class="test-log" id="testLog"></pre>
+    </div>
   </div>
 </div>
 
@@ -360,6 +403,119 @@ async function encryptAndDownload() {
     saveBtn.disabled = false;
   }
 }
+
+// ---- File Picker debug panel (iOS Safari + File Picker extension) ----
+// The "File Picker" Safari extension implements the File System Access API,
+// so the feature-detection below is the signal that direct read/write works.
+const debugPanel = $('debugPanel');
+const debugHeader = $('debugHeader');
+const diagBtn = $('diagBtn');
+const diagList = $('diagList');
+const testOpenBtn = $('testOpenBtn');
+const testSaveBtn = $('testSaveBtn');
+const testLog = $('testLog');
+
+function log(msg) {
+  const line = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  testLog.textContent = testLog.textContent ? testLog.textContent + '\n' + line : line;
+  testLog.scrollTop = testLog.scrollHeight;
+}
+
+function detectApis() {
+  const ua = navigator.userAgent;
+  const isIPad = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+  const isIOS = isIPad || /iPhone|iPod/.test(ua);
+  return [
+    { key: 'Secure context (HTTPS)', ok: isSecureContext },
+    { key: 'window.showOpenFilePicker', ok: 'showOpenFilePicker' in window, note: 'File System Access API — File Picker 拡張 / Chromium' },
+    { key: 'window.showSaveFilePicker', ok: 'showSaveFilePicker' in window, note: 'File System Access API の保存ピッカー' },
+    { key: 'FileSystemFileHandle', ok: 'FileSystemFileHandle' in window, note: '書き込みハンドル (createWritable)' },
+    { key: 'Platform', ok: true, val: isIOS ? (isIPad ? 'iPadOS' : 'iOS') : (navigator.userAgentData?.platform || ua) },
+  ];
+}
+
+function runDiagnostics() {
+  diagList.innerHTML = '';
+  const hasFSAA = 'showSaveFilePicker' in window || 'showOpenFilePicker' in window;
+  for (const d of detectApis()) {
+    const li = document.createElement('li');
+    const status = document.createElement('span');
+    status.className = 'status ' + (d.ok ? 'ok' : 'ng');
+    status.textContent = d.ok ? '✓' : '✗';
+    const key = document.createElement('span');
+    key.className = 'key';
+    key.textContent = d.key;
+    const val = document.createElement('span');
+    val.textContent = d.val || (d.ok ? '利用可' : '未対応');
+    li.append(status, key, val);
+    if (d.note) li.title = d.note;
+    diagList.appendChild(li);
+  }
+  const hint = document.createElement('div');
+  hint.className = 'diag-hint';
+  hint.textContent = hasFSAA
+    ? 'File System Access API が利用可能です。開く/保存テストでローカルファイルに直接読み書きできます。'
+    : 'File System Access API はこのブラウザで未対応です。iOS Safari では App Store の「File Picker」アプリをインストールし、このサイトで Safari 拡張を有効化して再読み込みすると使えるようになります。';
+  diagList.appendChild(hint);
+  log('診断完了。');
+}
+
+function isTextLike(file) {
+  return file.type.startsWith('text/') || /\.(txt|json|jsonc|md|cfg)$/i.test(file.name);
+}
+
+async function describeFile(file) {
+  log('選択: ' + file.name + '  size=' + formatSize(file.size) + '  type=' + (file.type || 'n/a'));
+  if (isTextLike(file)) {
+    try {
+      log('内容: ' + (await file.text()).slice(0, 200).replace(/\n/g, '\\n'));
+    } catch (err) {
+      log('読み込み失敗: ' + (err.message || err));
+    }
+  }
+}
+
+async function testOpenPicker() {
+  if (!('showOpenFilePicker' in window)) {
+    log('showOpenFilePicker が利用できません。診断を実行して環境を確認してください');
+    return;
+  }
+  log('開くテスト: ピッカーを起動します…');
+  try {
+    const [handle] = await window.showOpenFilePicker();
+    await describeFile(await handle.getFile());
+  } catch (e) {
+    if (e.name === 'AbortError') log('開くテストはキャンセルされました');
+    else log('開くテスト失敗: ' + (e.message || e));
+  }
+}
+
+async function testSavePicker() {
+  if (!('showSaveFilePicker' in window) || !('FileSystemFileHandle' in window)) {
+    log('showSaveFilePicker / FileSystemFileHandle が利用できません。診断を実行して環境を確認してください');
+    return;
+  }
+  const payload = 'McTools file-picker debug test\n' + new Date().toISOString() + '\n';
+  log('保存テスト: mctools_test.txt を書き込みます…');
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: 'mctools_test.txt',
+      types: [{ description: 'Text file', accept: { 'text/plain': ['.txt'] } }],
+    });
+    const writable = await handle.createWritable();
+    await writable.write(payload);
+    await writable.close();  // File Picker persists writes on close
+    log('書き込み成功: "' + handle.name + '" に ' + payload.length + ' バイト（close 時に確定）');
+  } catch (e) {
+    if (e.name === 'AbortError') log('保存テストはキャンセルされました');
+    else log('保存テスト失敗: ' + (e.message || e));
+  }
+}
+
+debugHeader.addEventListener('click', () => debugPanel.classList.toggle('open'));
+diagBtn.addEventListener('click', runDiagnostics);
+testOpenBtn.addEventListener('click', testOpenPicker);
+testSaveBtn.addEventListener('click', testSavePicker);
 
 // ---- Events ----
 saveBtn.addEventListener('click', encryptAndDownload);
