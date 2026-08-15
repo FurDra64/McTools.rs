@@ -42,6 +42,7 @@ header span{color:var(--text-dim);font-size:.82rem}
 /* Error */
 .error{display:none;background:#2d1215;border:1px solid #4a2025;border-radius:6px;padding:10px 14px;margin:12px 0;font-size:.85rem;white-space:pre-wrap;word-break:break-all}
 .error.active{display:block}
+.error.success{background:#0e2b1c;border:1px solid #1c5a33}
 
 /* File tree */
 .file-tree{display:none;margin-top:16px}
@@ -81,7 +82,7 @@ header span{color:var(--text-dim);font-size:.82rem}
 
 /* Save bar */
 .save-bar{display:none;position:sticky;bottom:0;padding:12px 0;background:var(--bg)}
-.save-bar.active{display:block}
+.save-bar.active{display:flex;flex-direction:column;gap:8px}
 .save-bar button{
   width:100%;padding:12px;
   background:var(--accent);color:#fff;border:none;border-radius:6px;
@@ -89,6 +90,11 @@ header span{color:var(--text-dim);font-size:.82rem}
 }
 .save-bar button:disabled{opacity:.4;cursor:not-allowed}
 .save-bar button:not(:disabled):active{opacity:.8}
+.save-bar .btn-secondary{background:var(--surface);color:var(--text);border:1px solid var(--border);font-weight:600}
+.save-bar .btn-secondary:not(:disabled):active{opacity:.8}
+.save-bar .btn-text{background:transparent;border:none;color:var(--text-dim);font-size:.8rem;font-weight:500}
+.save-bar .btn-text:not(:disabled):hover{color:var(--accent)}
+.save-bar .btn-text:disabled{opacity:.4;cursor:not-allowed}
 
 /* Debug panel (iOS Safari + File Picker extension diagnostics) */
 .debug-panel{margin-top:24px;border:1px solid var(--border);border-radius:6px;background:var(--surface)}
@@ -139,6 +145,8 @@ header span{color:var(--text-dim);font-size:.82rem}
 
   <div class="save-bar" id="saveBar">
     <button id="saveBtn" disabled>🔒 Encrypt & Download</button>
+    <button id="saveMinecraftBtn" class="btn-secondary" disabled>📁 Save to Minecraft (premium_cache)</button>
+    <button id="saveManualBtn" class="btn-text" disabled>💾 フォルダを選んで手動保存</button>
   </div>
 
   <!-- Debug panel: iOS Safari + File Picker extension (File System Access API) diagnostics -->
@@ -188,11 +196,14 @@ const treeRoot = $('treeRoot');
 const fileCount = $('fileCount');
 const saveBar = $('saveBar');
 const saveBtn = $('saveBtn');
+const saveMinecraftBtn = $('saveMinecraftBtn');
+const saveManualBtn = $('saveManualBtn');
 
 let state = { files: [], baseDir: '' };
 
 function showError(msg) { errorMsg.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg); errorDiv.classList.add('active'); }
-function hideError() { errorDiv.classList.remove('active'); }
+function showSuccess(msg) { errorMsg.textContent = typeof msg === 'string' ? msg : JSON.stringify(msg); errorDiv.classList.add('active', 'success'); }
+function hideError() { errorDiv.classList.remove('active', 'success'); }
 function showSpinner(msg) { spinnerMsg.textContent = msg; spinner.classList.add('active'); }
 function hideSpinner() { spinner.classList.remove('active'); }
 function bytesToStr(b) { return new TextDecoder().decode(b); }
@@ -294,100 +305,114 @@ function renderTreeView(files) {
   fileTree.classList.add('active');
   saveBar.classList.add('active');
   saveBtn.disabled = false;
+  saveMinecraftBtn.disabled = false;
+  saveManualBtn.disabled = false;
 }
 
 // ---- Encrypt & Save ----
+// Build the encrypted McTools pack as a zip.
+//   compression: 'STORE' (C# in-place parity, used by the download) or 'DEFLATE' (premium_cache format)
+//   flatten:     true writes files at the zip root (manifest.json directly inside), matching the
+//                layout the game's own marketplace packs use in premium_cache. false keeps the
+//                original wrapper folder like the C# reference output.
+async function buildEncryptedZip({ compression = 'STORE', flatten = false } = {}) {
+  // Find manifest.json for UUID
+  const mf = state.files.find(f => f.path.endsWith('manifest.json'));
+  if (!mf) throw new Error('manifest.json not found');
+  let uuid;
+  try { uuid = JSON.parse(bytesToStr(mf.data)).header?.uuid; } catch(e) {}
+  if (!uuid) throw new Error('header.uuid not found in manifest.json');
+
+  const baseDir = state.baseDir;
+
+  // Build a map of relative path → file entry (paths inside content list must be relative like C#)
+  const fileMap = new Map();
+  for (const f of state.files) {
+    const relPath = f.path.startsWith(baseDir) ? f.path.slice(baseDir.length) : f.path;
+    fileMap.set(relPath, f);
+  }
+
+  // Collect unique directory paths (matches C# GetFileSystemEntries returning directories)
+  const dirSet = new Set();
+  for (const relPath of fileMap.keys()) {
+    const parts = relPath.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      dirSet.add(parts.slice(0, i).join('/') + '/');
+    }
+  }
+
+  // Create signatures.json FIRST (C# calls SignManifest before EncryptContents)
+  const manifestRelPath = mf.path.startsWith(baseDir) ? mf.path.slice(baseDir.length) : mf.path;
+  const manifestHash = mctools.sha256_digest(mf.data);
+  const sigB64 = btoa(String.fromCharCode(...manifestHash));
+  const sigJsonStr = JSON.stringify([{ hash: sigB64, path: manifestRelPath }]);
+  const sigBuf = strToBytes(sigJsonStr);
+
+  // Build content list matching C# behaviour:
+  //   - Sort alphabetically for deterministic order
+  //   - Directory entries with trailing /, no key
+  //   - Files get encrypted or not based on shouldEncrypt(path)
+  //   - signatures.json is NOT in DONT_ENCRYPT → gets a key
+  const content = [];
+
+  // Collect all relative paths (files + directories), sort for deterministic order
+  const allPaths = new Set(fileMap.keys());
+  for (const dirPath of dirSet) allPaths.add(dirPath);
+  allPaths.add('signatures.json');  // will be signed
+  const sortedPaths = [...allPaths].sort();
+
+  for (const relPath of sortedPaths) {
+    if (relPath === 'signatures.json') {
+      // Signatures.json: generated, encrypt with a random key
+      const key = generateKey();
+      const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), sigBuf);
+      content.push({ path: relPath, key });
+      // Store for zip output (keyed by relPath)
+      fileMap.set(relPath, { data: sigBuf, _encrypted: enc });
+    } else if (dirSet.has(relPath)) {
+      // Directory entry: no key, no data
+      content.push({ path: relPath });
+    } else {
+      const f = fileMap.get(relPath);
+      if (f && shouldEncrypt(relPath)) {
+        const key = generateKey();
+        const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), f.data);
+        f._encrypted = enc;
+        content.push({ path: relPath, key });
+      } else if (f) {
+        content.push({ path: relPath });
+      }
+    }
+  }
+
+  // Build minified contents.json (must match C# JsonConvert.SerializeObject output)
+  const cjStr = JSON.stringify({ version: 1, content });
+  const encCj = mctools.aes256_cfb8_encrypt(strToBytes(HARDCODED_KEY), strToBytes(cjStr));
+  const finalCj = mctools.build_encrypted_header(uuid, encCj);
+
+  // Build output zip. STORE matches C# in-place encryption; DEFLATE matches the game's premium_cache packs.
+  // flatten=true drops the wrapper folder so manifest.json sits at the zip root (game marketplace layout).
+  const newZip = new JSZip();
+  const prefix = flatten ? '' : baseDir;
+  newZip.file(prefix + 'contents.json', new Uint8Array(finalCj));
+
+  // Add all files (including signatures.json now in fileMap)
+  for (const [relPath, f] of fileMap) {
+    const fpath = prefix + relPath;
+    const data = f._encrypted || f.data;
+    if (data) newZip.file(fpath, new Uint8Array(data));
+  }
+
+  const blob = await newZip.generateAsync({ type: 'blob', compression });
+  return { blob, uuid };
+}
+
 async function encryptAndDownload() {
   hideError();
   saveBtn.disabled = true;
   saveBtn.textContent = '⏳ Encrypting…';
   try {
-    // Find manifest.json for UUID
-    const mf = state.files.find(f => f.path.endsWith('manifest.json'));
-    if (!mf) throw new Error('manifest.json not found');
-    let uuid;
-    try { uuid = JSON.parse(bytesToStr(mf.data)).header?.uuid; } catch(e) {}
-    if (!uuid) throw new Error('header.uuid not found in manifest.json');
-
-    const baseDir = state.baseDir;
-
-    // Build a map of relative path → file entry (paths inside content list must be relative like C#)
-    const fileMap = new Map();
-    for (const f of state.files) {
-      const relPath = f.path.startsWith(baseDir) ? f.path.slice(baseDir.length) : f.path;
-      fileMap.set(relPath, f);
-    }
-
-    // Collect unique directory paths (matches C# GetFileSystemEntries returning directories)
-    const dirSet = new Set();
-    for (const relPath of fileMap.keys()) {
-      const parts = relPath.split('/');
-      for (let i = 1; i < parts.length; i++) {
-        dirSet.add(parts.slice(0, i).join('/') + '/');
-      }
-    }
-
-    // Create signatures.json FIRST (C# calls SignManifest before EncryptContents)
-    const manifestRelPath = mf.path.startsWith(baseDir) ? mf.path.slice(baseDir.length) : mf.path;
-    const manifestHash = mctools.sha256_digest(mf.data);
-    const sigB64 = btoa(String.fromCharCode(...manifestHash));
-    const sigJsonStr = JSON.stringify([{ hash: sigB64, path: manifestRelPath }]);
-    const sigBuf = strToBytes(sigJsonStr);
-
-    // Build content list matching C# behaviour:
-    //   - Sort alphabetically for deterministic order
-    //   - Directory entries with trailing /, no key
-    //   - Files get encrypted or not based on shouldEncrypt(path)
-    //   - signatures.json is NOT in DONT_ENCRYPT → gets a key
-    const content = [];
-
-    // Collect all relative paths (files + directories), sort for deterministic order
-    const allPaths = new Set(fileMap.keys());
-    for (const dirPath of dirSet) allPaths.add(dirPath);
-    allPaths.add('signatures.json');  // will be signed
-    const sortedPaths = [...allPaths].sort();
-
-    for (const relPath of sortedPaths) {
-      if (relPath === 'signatures.json') {
-        // Signatures.json: generated, encrypt with a random key
-        const key = generateKey();
-        const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), sigBuf);
-        content.push({ path: relPath, key });
-        // Store for zip output (keyed by relPath)
-        fileMap.set(relPath, { data: sigBuf, _encrypted: enc });
-      } else if (dirSet.has(relPath)) {
-        // Directory entry: no key, no data
-        content.push({ path: relPath });
-      } else {
-        const f = fileMap.get(relPath);
-        if (f && shouldEncrypt(relPath)) {
-          const key = generateKey();
-          const enc = mctools.aes256_cfb8_encrypt(strToBytes(key), f.data);
-          f._encrypted = enc;
-          content.push({ path: relPath, key });
-        } else if (f) {
-          content.push({ path: relPath });
-        }
-      }
-    }
-
-    // Build minified contents.json (must match C# JsonConvert.SerializeObject output)
-    const cjStr = JSON.stringify({ version: 1, content });
-    const encCj = mctools.aes256_cfb8_encrypt(strToBytes(HARDCODED_KEY), strToBytes(cjStr));
-    const finalCj = mctools.build_encrypted_header(uuid, encCj);
-
-    // Build output zip (STORE compression matches C# in-place encryption)
-    const newZip = new JSZip();
-    newZip.file(baseDir + 'contents.json', new Uint8Array(finalCj));
-
-    // Add all files (including signatures.json now in fileMap)
-    for (const [relPath, f] of fileMap) {
-      const fpath = baseDir + relPath;
-      const data = f._encrypted || f.data;
-      if (data) newZip.file(fpath, new Uint8Array(data));
-    }
-
-    const blob = await newZip.generateAsync({ type: 'blob', compression: 'STORE' });
+    const { blob } = await buildEncryptedZip({ compression: 'STORE', flatten: false });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = 'persona_encrypted.zip';
@@ -401,6 +426,150 @@ async function encryptAndDownload() {
     showError(e.message || String(e));
     saveBtn.textContent = '🔒 Encrypt & Download';
     saveBtn.disabled = false;
+  }
+}
+
+// ---- Save to Minecraft premium_cache ----
+// Writes the encrypted pack straight into premium_cache/skin_packs (the game's marketplace cache).
+// Needs File System Access API directory write access (Chrome/Edge, or the iOS "File Picker" extension).
+function randomPackName() {
+  // The game names premium_cache packs after a base64(8-byte) random id (e.g. "53ggYmmxb+Q=").
+  // Match that exactly; only '/' is impossible in a file name, so redraw when it appears.
+  let s;
+  do {
+    const b = crypto.getRandomValues(new Uint8Array(8));
+    s = btoa(String.fromCharCode(...b));
+  } while (s.includes('/'));
+  return s;
+}
+
+const MAX_DIR_SCAN = 8000;
+
+// Recursively scan the tree granted by showDirectoryPicker for a directory named skin_packs
+// whose parent is premium_cache, so the user can pick any level above it. Returns { handle, path }.
+// If the selected root itself is named skin_packs, use it directly (parent isn't visible via the API).
+async function findSkinPacks(rootHandle, onProgress) {
+  if (rootHandle.name === 'skin_packs') return { handle: rootHandle, path: rootHandle.name };
+  const found = [];
+  let visited = 0;
+
+  async function walk(dirHandle, pathParts) {
+    if (found.length) return;
+    if (++visited > MAX_DIR_SCAN) {
+      throw new Error('ディレクトリが多すぎます。premium_cache を含む、より狭いフォルダを選択してください');
+    }
+    if (onProgress && visited % 200 === 0) onProgress(visited);
+    let entries;
+    try { entries = dirHandle.values(); } catch { return; }
+    for await (const entry of entries) {
+      if (entry.kind !== 'directory') continue;
+      if (entry.name === 'skin_packs' && dirHandle.name === 'premium_cache') {
+        found.push({ handle: entry, path: [...pathParts, dirHandle.name, 'skin_packs'].join('/') });
+        return;
+      }
+      await walk(entry, [...pathParts, dirHandle.name]);
+    }
+  }
+
+  await walk(rootHandle, []);
+  return found[0] || null;
+}
+
+// Best-effort maintenance of the game's per-directory LRU ledger (.lru.json:
+// {"version":1,"entries":[{"id":"<manifest uuid>","last_used_sec":<unix sec>}]}).
+// Never fail the whole save on this — the game also falls back to the file mtime.
+async function updateLruJson(skinPacksHandle, uuid) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    let data = null;
+    try {
+      const fh = await skinPacksHandle.getFileHandle('.lru.json');
+      data = JSON.parse(await (await fh.getFile()).text());
+    } catch (e) { /* no .lru.json yet — create it */ }
+    const base = (data && typeof data === 'object') ? data : { version: 1 };
+    const entries = Array.isArray(base.entries) ? base.entries : [];
+    const next = entries.filter(e => e && e.id !== uuid);
+    next.push({ id: uuid, last_used_sec: now });
+    const fh = await skinPacksHandle.getFileHandle('.lru.json', { create: true });
+    const w = await fh.createWritable();
+    await w.write(JSON.stringify({ ...base, entries: next }));
+    await w.close();
+  } catch (e) {
+    console.warn('Failed to update .lru.json:', e);
+  }
+}
+
+async function saveToMinecraft() {
+  hideError();
+  if (!state.files.length) { showError('先にスキンパック（.zip / .mcpack）を読み込んでください'); return; }
+
+  const secure = isSecureContext;
+  const hasDir = 'showDirectoryPicker' in window;
+  log('Save to Minecraft: isSecureContext=' + secure + ' showDirectoryPicker=' + hasDir + ' URL=' + location.href);
+
+  if (!hasDir) {
+    // Don't silently fall back to a file dialog (that reads as "it wants a file, not a folder").
+    // Explain the cause and point to the explicit manual-save button instead.
+    showError(
+      'フォルダを直接選択できないため、自動保存は使えません。\n\n' +
+      (secure
+        ? 'このブラウザでは showDirectoryPicker（フォルダ選択 API）が利用できません。\nChrome/Edge、または iOS では App Store の「File Picker」拡張を有効化してください。'
+        : 'このページはセキュアでない接続（http の IP アドレス等）で開かれているため、ファイル選択 API が無効です。\nhttps:// または http://localhost で開き直してください。\n現在の URL: ' + location.href) +
+      '\n\n「💾 フォルダを選んで手動保存」なら保存先を自分で選べます。'
+    );
+    return;
+  }
+  let rootHandle;
+  try {
+    rootHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    showError('フォルダを開けませんでした: ' + (e.message || e));
+    return;
+  }
+  showSpinner('premium_cache/skin_packs を検索中…');
+  try {
+    const target = await findSkinPacks(rootHandle, n => {
+      spinnerMsg.textContent = 'premium_cache/skin_packs を検索中… (' + n + ' フォルダ)';
+    });
+    hideSpinner();
+    if (!target) {
+      showError('選択したフォルダの中に premium_cache/skin_packs が見つかりませんでした。\n「Minecraft Bedrock」や「premium_cache」など、premium_cache を含む階層を選択してください。');
+      return;
+    }
+    showSpinner('暗号化して保存中…');
+    const { blob, uuid } = await buildEncryptedZip({ compression: 'DEFLATE', flatten: true });
+    const name = randomPackName();
+    const fh = await target.handle.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await w.write(blob);
+    await w.close();
+    await updateLruJson(target.handle, uuid);
+    hideSpinner();
+    showSuccess('Minecraft に保存しました 📁\n' + target.path + '/' + name + '\n\nMinecraft を再起動するか、更衣室でスキンパックを再読み込みすると反映されます。');
+  } catch (e) {
+    hideSpinner();
+    showError('保存に失敗しました: ' + (e.message || e));
+  }
+}
+
+// Fallback when showDirectoryPicker is unavailable: the user navigates to the target folder
+// with the OS save dialog and confirms the (extensionless) file name. .lru.json cannot be updated here.
+async function saveToMinecraftManual() {
+  if (!('showSaveFilePicker' in window) || !('FileSystemFileHandle' in window)) {
+    showError('このブラウザではファイルの直接保存にも未対応です。Chrome/Edge または iOS の File Picker 拡張でお試しください。');
+    return;
+  }
+  try {
+    const { blob } = await buildEncryptedZip({ compression: 'DEFLATE', flatten: true });
+    const handle = await window.showSaveFilePicker({ suggestedName: randomPackName() });
+    const w = await handle.createWritable();
+    await w.write(blob);
+    await w.close();
+    showSuccess('保存しました。premium_cache/skin_packs 内に保存した場合、Minecraft を再起動して確認してください。');
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    showError('保存に失敗しました: ' + (e.message || e));
   }
 }
 
@@ -429,6 +598,7 @@ function detectApis() {
     { key: 'Secure context (HTTPS)', ok: isSecureContext },
     { key: 'window.showOpenFilePicker', ok: 'showOpenFilePicker' in window, note: 'File System Access API — File Picker 拡張 / Chromium' },
     { key: 'window.showSaveFilePicker', ok: 'showSaveFilePicker' in window, note: 'File System Access API の保存ピッカー' },
+    { key: 'window.showDirectoryPicker', ok: 'showDirectoryPicker' in window, note: 'ディレクトリ選択 — premium_cache 自動認識に必要' },
     { key: 'FileSystemFileHandle', ok: 'FileSystemFileHandle' in window, note: '書き込みハンドル (createWritable)' },
     { key: 'Platform', ok: true, val: isIOS ? (isIPad ? 'iPadOS' : 'iOS') : (navigator.userAgentData?.platform || ua) },
   ];
@@ -519,6 +689,8 @@ testSaveBtn.addEventListener('click', testSavePicker);
 
 // ---- Events ----
 saveBtn.addEventListener('click', encryptAndDownload);
+saveMinecraftBtn.addEventListener('click', saveToMinecraft);
+saveManualBtn.addEventListener('click', saveToMinecraftManual);
 fileInput.addEventListener('change', e => { if (e.target.files[0]) loadZip(e.target.files[0]); });
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
